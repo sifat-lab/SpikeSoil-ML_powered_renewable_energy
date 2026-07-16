@@ -3,7 +3,6 @@
 #include <SPI.h>
 #include <SdFat.h>
 #include <math.h>
-#include <stdlib.h>
 
 namespace {
 
@@ -16,8 +15,6 @@ constexpr int kLedPin = 38;  // onboard RGB LED (WS2812, driven via neopixelWrit
 const char kCsvHeader[] =
     "timestamp,epoch,vA,iA_mA,pA_mW,vB,iB_mA,pB_mW,lux,tA_C,tB_C";
 
-const char kEpochStatePath[] = "/clockstate.txt";
-
 constexpr uint32_t kSdRetryIntervalMs = 30000;
 
 SPIClass spi(FSPI);
@@ -28,8 +25,8 @@ uint32_t lastSdRetryMs = 0;
 // The single point of contact with sd.begin(). lastSdRetryMs is seeded by
 // loggerInit()'s initial attempt (success or failure), so this cooldown
 // applies from boot onward -- there is no "never retried yet" bypass that
-// would let a second caller (e.g. loggerLoadPersistedEpoch) fire a begin()
-// back-to-back with the first and wedge the card's SPI init sequence.
+// would let a second caller fire a begin() back-to-back with the first and
+// wedge the card's SPI init sequence.
 bool ensureSdReady() {
   if (sdReady) {
     return true;
@@ -131,57 +128,4 @@ bool loggerWriteRow(const String &dateKey, const String &timestamp, uint32_t epo
   f.sync();
   f.close();
   return true;
-}
-
-bool loggerLoadPersistedEpoch(uint32_t *epochOut) {
-  // Read-only, boot-time, best-effort: never forces an sd.begin() of its
-  // own. If loggerInit()'s mount hasn't succeeded (or its retry cooldown
-  // hasn't elapsed), just skip -- ensureSdReady()'s single retry flow
-  // (used by loggerWriteRow/loggerPersistEpoch) will bring the card up on
-  // its own schedule, without a second caller racing it at boot.
-  if (!sdReady) {
-    Serial.println("[logger][clockstate.open] SD not ready yet; skipping");
-    return false;
-  }
-  if (!sd.exists(kEpochStatePath)) {
-    Serial.println("[logger][clockstate.open] no persisted clock state (first boot)");
-    return false;
-  }
-  FsFile f = sd.open(kEpochStatePath, O_READ);
-  if (!f) {
-    Serial.println("[logger][clockstate.open] open failed");
-    return false;
-  }
-  char buf[16] = {0};
-  const int n = f.read(buf, sizeof(buf) - 1);
-  f.close();
-  if (n <= 0) {
-    Serial.println("[logger][clockstate.open] read failed/empty");
-    return false;
-  }
-  const uint32_t epoch = strtoul(buf, nullptr, 10);
-  if (epoch == 0) {
-    Serial.println("[logger][clockstate.open] invalid contents");
-    return false;
-  }
-  Serial.println("[logger][clockstate.open] ok");
-  *epochOut = epoch;
-  return true;
-}
-
-void loggerPersistEpoch(uint32_t epoch) {
-  // Called only every ~10 minutes from loop(), long past the SD retry
-  // cooldown, so going through the shared ensureSdReady() flow here can't
-  // race a fresh mount attempt the way a boot-time caller could.
-  if (!ensureSdReady()) {
-    return;
-  }
-  FsFile f = sd.open(kEpochStatePath, O_WRITE | O_CREAT | O_TRUNC);
-  if (!f) {
-    Serial.println("[logger][clockstate.write] open failed");
-    return;
-  }
-  f.print(epoch);
-  f.sync();
-  f.close();
 }
