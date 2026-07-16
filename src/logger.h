@@ -14,3 +14,12 @@ void loggerInit();
 // so the caller can mirror it to Serial.
 bool loggerWriteRow(const String &dateKey, const String &timestamp, uint32_t epoch, const SensorReading &r,
                      String *csvRowOut = nullptr);
+
+// Loads the last epoch (unix seconds) persisted by loggerPersistEpoch(), for
+// use as a clock floor when NTP hasn't synced yet this boot. Returns false
+// if no valid state file exists on the SD card.
+bool loggerLoadPersistedEpoch(uint32_t *epochOut);
+
+// Persists the current best-known epoch (unix seconds) to SD so it survives
+// a reboot and can seed the next boot's clock floor.
+void loggerPersistEpoch(uint32_t epoch);

@@ -11,9 +11,20 @@ namespace {
 constexpr uint32_t kWifiTimeoutMs = 15000;
 constexpr long kTzOffsetSec = 6 * 3600;  // UTC+6 (Dhaka)
 constexpr uint32_t kLogIntervalMs = 5000;
+constexpr uint32_t kReconnectIntervalMs = 5UL * 60UL * 1000UL;   // retry WiFi+NTP every 5 min
+constexpr uint32_t kEpochPersistIntervalMs = 10UL * 60UL * 1000UL;  // save clock floor every 10 min
 
 bool g_timeSynced = false;
+
+// Clock floor restored from SD (or set once NTP syncs) so timestamps stay
+// monotonic and roughly correct across a reboot that happens without WiFi.
+bool g_haveFloorEpoch = false;
+uint32_t g_floorEpoch = 0;
+uint32_t g_floorSetMs = 0;
+
 uint32_t g_lastLogMs = 0;
+uint32_t g_lastReconnectAttemptMs = 0;
+uint32_t g_lastEpochPersistMs = 0;
 
 struct RowTime {
   String dateKey;
@@ -80,9 +91,27 @@ bool connectWifiAndSyncTime() {
   return true;
 }
 
-// Local (UTC+6) timestamp + daily-file date key, or a millis()-based
-// fallback (epoch=0) when NTP time was never obtained.
+// Best current estimate of the unix epoch: the synced system clock if NTP
+// has landed, else the restored/last-known floor advanced by elapsed
+// millis(), else 0 (no notion of real time at all yet).
+uint32_t currentEstimatedEpoch() {
+  if (g_timeSynced) {
+    return static_cast<uint32_t>(time(nullptr));
+  }
+  if (g_haveFloorEpoch) {
+    return g_floorEpoch + (millis() - g_floorSetMs) / 1000;
+  }
+  return 0;
+}
+
+// Local (UTC+6) timestamp + daily-file date key. Three cases, in order of
+// preference: NTP-synced system clock; a restored/carried-forward floor
+// epoch (marked with a leading '~' since it's approximate, but still
+// monotonic and roughly correct); or a millis()-based REL+ fallback when we
+// have no notion of real time at all.
 RowTime currentRowTime() {
+  RowTime rt;
+
   if (g_timeSynced) {
     time_t now = time(nullptr);
     if (now > kTzOffsetSec) {
@@ -95,15 +124,29 @@ RowTime currentRowTime() {
       char isoBuf[24];
       strftime(isoBuf, sizeof(isoBuf), "%Y-%m-%dT%H:%M:%S", &timeinfo);
 
-      RowTime rt;
       rt.dateKey = dateBuf;
       rt.timestamp = String(isoBuf) + "+06:00";
       rt.epoch = static_cast<uint32_t>(now);
       return rt;
     }
+  } else if (g_haveFloorEpoch) {
+    const uint32_t epoch = g_floorEpoch + (millis() - g_floorSetMs) / 1000;
+    const time_t localT = static_cast<time_t>(epoch) + kTzOffsetSec;
+    struct tm timeinfo;
+    gmtime_r(&localT, &timeinfo);
+
+    char dateBuf[9];
+    strftime(dateBuf, sizeof(dateBuf), "%Y%m%d", &timeinfo);
+
+    char isoBuf[24];
+    strftime(isoBuf, sizeof(isoBuf), "%Y-%m-%dT%H:%M:%S", &timeinfo);
+
+    rt.dateKey = dateBuf;
+    rt.timestamp = "~" + String(isoBuf) + "+06:00";
+    rt.epoch = epoch;
+    return rt;
   }
 
-  RowTime rt;
   rt.dateKey = "nodate";
   rt.timestamp = "REL+" + String(millis() / 1000.0, 3) + "s";
   rt.epoch = 0;
@@ -123,11 +166,47 @@ void setup() {
 
   g_timeSynced = connectWifiAndSyncTime();
 
-  g_lastLogMs = millis();
+  if (!g_timeSynced) {
+    uint32_t floorEpoch = 0;
+    if (loggerLoadPersistedEpoch(&floorEpoch)) {
+      g_haveFloorEpoch = true;
+      g_floorEpoch = floorEpoch;
+      g_floorSetMs = millis();
+      Serial.print("[clock] no NTP yet; restored floor epoch from SD: ");
+      Serial.println(floorEpoch);
+    }
+  }
+
+  const uint32_t nowMs = millis();
+  g_lastLogMs = nowMs;
+  g_lastReconnectAttemptMs = nowMs;
+  g_lastEpochPersistMs = nowMs;
 }
 
 void loop() {
-  uint32_t nowMs = millis();
+  const uint32_t nowMs = millis();
+
+  // Field units may boot or spend most of their life out of WiFi range;
+  // keep retrying both WiFi and NTP (not just NTP) since the device can
+  // wander back into range mid-run.
+  if (!g_timeSynced && nowMs - g_lastReconnectAttemptMs >= kReconnectIntervalMs) {
+    g_lastReconnectAttemptMs = nowMs;
+    Serial.println("[wifi] retrying WiFi/NTP sync...");
+    if (connectWifiAndSyncTime()) {
+      g_timeSynced = true;
+      g_haveFloorEpoch = false;  // system clock is authoritative now
+      Serial.println("[wifi] time synced mid-run; switching to dated log file");
+    }
+  }
+
+  if (nowMs - g_lastEpochPersistMs >= kEpochPersistIntervalMs) {
+    g_lastEpochPersistMs = nowMs;
+    const uint32_t epoch = currentEstimatedEpoch();
+    if (epoch != 0) {
+      loggerPersistEpoch(epoch);
+    }
+  }
+
   if (nowMs - g_lastLogMs < kLogIntervalMs) {
     return;
   }

@@ -16,7 +16,7 @@ constexpr uint32_t kI2cClockHz = 100000;
 constexpr uint8_t kIna219AddrA = 0x40;
 constexpr uint8_t kIna219AddrB = 0x41;
 constexpr uint8_t kBh1750Addr = 0x23;
-constexpr int kOneWirePin = 4;
+constexpr int kOneWirePin = 15;
 
 Adafruit_INA219 ina219A(kIna219AddrA);
 Adafruit_INA219 ina219B(kIna219AddrB);
