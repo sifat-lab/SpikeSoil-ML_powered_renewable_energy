@@ -38,6 +38,7 @@ void sensorsInit() {
   ina219A.begin(&Wire);
   ina219B.begin(&Wire);
   lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, kBh1750Addr, &Wire);
+  lightMeter.setMTreg(31);   // lowest sensitivity → range ~121k lux, দুপুরের রোদেও saturate করবে না
 
   dsSensors.setOneWire(&oneWire);
   dsSensors.begin();
