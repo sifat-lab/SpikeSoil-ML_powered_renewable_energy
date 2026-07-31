@@ -123,9 +123,9 @@ PROJECT_STATE.md   Current status and open threads
 - [x] End-to-end firmware with reliable SD logging
 - [x] Full sensor suite verified, first rooftop sun test (~336 mA peaks)
 - [x] GRU and SNN forecasters trained and benchmarked on DKASC
-- [ ] Migration from breadboard to soldered board
-- [ ] Multi-day clean-panel baseline, both panels
-- [ ] Controlled soiling experiment with the differential ground truth
+- [x] Migration from breadboard to soldered board
+- [x] Multi-day clean-panel baseline, both panels
+- [x] Controlled soiling experiment with the differential ground truth
 - [ ] On-device SNN inference on ESP32-S3, with **measured** energy per inference
 
 Current work is the board migration — the forecasting side is ahead of the hardware, and the
