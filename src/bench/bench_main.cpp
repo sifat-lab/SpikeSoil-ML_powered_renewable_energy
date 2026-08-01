@@ -31,26 +31,28 @@
 extern "C" {
   #include "lif_snn.h"
 }
-#include "golden.h"
-#include "soiling_snn.h"
+#include SNN_MODEL_HEADER
+#include SNN_GOLDEN_HEADER
 
 #define GPIO_MARKER  21   /* HIGH during event-driven inference */
 #define GPIO_MARKER2 47   /* HIGH during dense inference */
 #define GPIO_AUTORUN 14   /* tie to GND to run the energy sequence on boot */
 #define ENERGY_SECONDS 30
 
-static float in_buf[SNN_T * SNN_NF];
+static float y[SNN_NOUT];
 
 static void verify() {
   float worst = 0;
   Serial.println(F("\n idx        device        pytorch       abs err"));
   for (int n = 0; n < N_GOLDEN; ++n) {
-    const float *x = &golden_in[n * SNN_T * SNN_NF];
     snn_stats_t st;
-    float y = snn_infer(x, &st);
-    float e = fabsf(y - golden_out[n]);
-    if (e > worst) worst = e;
-    Serial.printf("%4d  %12.8f  %12.8f  %12.3e\n", n, y, golden_out[n], e);
+    snn_infer(&golden_in[n * SNN_T * SNN_NF], y, &st);
+    for (int k = 0; k < SNN_NOUT; ++k) {
+      float ref = golden_out[n * SNN_NOUT + k];
+      float e = fabsf(y[k] - ref);
+      if (e > worst) worst = e;
+      Serial.printf("%4d.%d  %12.8f  %12.8f  %12.3e\n", n, k, y[k], ref, e);
+    }
   }
   Serial.printf("worst = %.3e  -> %s\n", worst,
                 worst < 1e-4f ? "PASS" : "FAIL (kernel does not match training)");
@@ -65,21 +67,24 @@ static void latency() {
   /* An event-driven net's cost depends on its INPUT. Benchmarking one window
    * measures that window, not the model. Rotate through all of them. */
   for (int n = 0; n < N_GOLDEN; ++n) {
-    snn_infer(&golden_in[n * SNN_T * SNN_NF], &sp);
+    snn_infer(&golden_in[n * SNN_T * SNN_NF], y, &sp);
     Serial.printf("  window %d: %lu MACs  rate %.4f\n", n, sp.macs, sp.rate);
     mac_sum += sp.macs; rate_sum += sp.rate;
   }
 
-  for (int i = 0; i < 50; ++i)
-    sink += snn_infer(&golden_in[(i % N_GOLDEN) * SNN_T * SNN_NF], &sp);
+  for (int i = 0; i < 50; ++i) {
+    snn_infer(&golden_in[(i % N_GOLDEN) * SNN_T * SNN_NF], y, &sp); sink += y[0];
+  }
 
   const int N = 2000;
   int64_t t0 = esp_timer_get_time();
-  for (int i = 0; i < N; ++i)
-    sink += snn_infer(&golden_in[(i % N_GOLDEN) * SNN_T * SNN_NF], &sp);
+  for (int i = 0; i < N; ++i) {
+    snn_infer(&golden_in[(i % N_GOLDEN) * SNN_T * SNN_NF], y, &sp); sink += y[0];
+  }
   int64_t t1 = esp_timer_get_time();
-  for (int i = 0; i < N; ++i)
-    sink += snn_infer_dense(&golden_in[(i % N_GOLDEN) * SNN_T * SNN_NF], &dn);
+  for (int i = 0; i < N; ++i) {
+    snn_infer_dense(&golden_in[(i % N_GOLDEN) * SNN_T * SNN_NF], y, &dn); sink += y[0];
+  }
   int64_t t2 = esp_timer_get_time();
   for (int i = 0; i < N; ++i)
     sink += snn_infer_lif_only(&golden_in[(i % N_GOLDEN) * SNN_T * SNN_NF], NULL);
@@ -107,11 +112,12 @@ static void latency() {
 
 static void memory_report() {
   size_t w = sizeof(snn_f1_w) + sizeof(snn_f1_b) + sizeof(snn_f2_wT)
-           + sizeof(snn_f2_b) + sizeof(snn_out_w) + sizeof(snn_out_b)
+           + sizeof(snn_f2_b) + sizeof(snn_out_wT) + sizeof(snn_out_b)
            + sizeof(snn_mu) + sizeof(snn_sd);
   Serial.printf("\nweights in flash : %u B (%u params, float32)\n",
                 (unsigned)w, (unsigned)(w / 4));
-  Serial.printf("input buffer     : %u B\n", (unsigned)sizeof(in_buf));
+  Serial.printf("input window     : %u B\n",
+                (unsigned)(SNN_T * SNN_NF * sizeof(float)));
   Serial.printf("scratch (stack)  : ~%u B  (4 x SNN_H floats + locals)\n",
                 (unsigned)(4 * SNN_H * sizeof(float)));
   Serial.printf("free heap        : %u B\n", (unsigned)ESP.getFreeHeap());
@@ -139,8 +145,8 @@ static void energy_run(int mode) {
   digitalWrite(GPIO_MARKER2, mode == 2 ? HIGH : LOW);
   while (esp_timer_get_time() < t_end) {
     const float *x = &golden_in[(n % N_GOLDEN) * SNN_T * SNN_NF];
-    if      (mode == 1) { sink += snn_infer(x, &st);       n++; }
-    else if (mode == 2) { sink += snn_infer_dense(x, &st); n++; }
+    if      (mode == 1) { snn_infer(x, y, &st);       sink += y[0]; n++; }
+    else if (mode == 2) { snn_infer_dense(x, y, &st); sink += y[0]; n++; }
   }
   digitalWrite(GPIO_MARKER,  LOW);
   digitalWrite(GPIO_MARKER2, LOW);
@@ -180,8 +186,9 @@ void setup() {
   digitalWrite(GPIO_MARKER2, LOW);
 
   Serial.println(F("\nSpikeSoil Phase D benchmark"));
-  Serial.printf("CPU %d MHz | SNN %d-%d-%d, T=%d\n",
-                getCpuFrequencyMhz(), SNN_NF, SNN_H, SNN_H, SNN_T);
+  Serial.printf("CPU %d MHz | SNN %d-%d-%d-%d, T=%d, beta=%.2f/%.2f\n",
+                getCpuFrequencyMhz(), SNN_NF, SNN_H, SNN_H, SNN_NOUT, SNN_T,
+                SNN_BETA, SNN_BETA_OUT);
   Serial.println(F("commands: v verify | l latency | m memory | a sparse | d dense | b idle"));
   /* Run the energy sequence unconditionally. Requiring a jumper meant a
    * missing wire looked exactly like a broken measurement -- BUSY stays empty
