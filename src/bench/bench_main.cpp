@@ -33,11 +33,28 @@ extern "C" {
 }
 #include SNN_MODEL_HEADER
 #include SNN_GOLDEN_HEADER
+#ifdef HAVE_MLP
+extern "C" {
+  #include "mlp_ann.h"
+}
+#include "soiling_mlp.h"
+#include "soiling_mlp_golden.h"
+#endif
+#ifdef HAVE_GRU
+extern "C" {
+  #include "gru_ann.h"
+}
+#include "forecast_gru.h"
+#include "forecast_gru_golden.h"
+static float gy[GRU_NOUT];
+#endif
 
-#define GPIO_MARKER  21   /* HIGH during event-driven inference */
-#define GPIO_MARKER2 47   /* HIGH during dense inference */
+/* Two pins encode four phases, so the ANN gets its own bucket without a
+ * third wire:  00 idle | 01 event-driven | 10 dense SNN | 11 dense ANN */
+#define GPIO_MARKER  21
+#define GPIO_MARKER2 47
 #define GPIO_AUTORUN 14   /* tie to GND to run the energy sequence on boot */
-#define ENERGY_SECONDS 30
+#define ENERGY_SECONDS 60   /* long enough for each phase to reach thermal steady state */
 
 static float y[SNN_NOUT];
 
@@ -131,8 +148,9 @@ static void memory_report() {
  * the sparse kernel would beg the question the benchmark exists to answer. */
 static void energy_run(int mode) {
   const char *name = mode == 0 ? "IDLE (no inference)"
-                   : mode == 1 ? "BUSY (event-driven)"
-                               : "BUSY (dense)";
+                   : mode == 1 ? "BUSY (SNN event-driven)"
+                   : mode == 2 ? "BUSY (SNN dense)"
+                               : "BUSY (ANN baseline)";
   Serial.printf("\n%s for %d s\n", name, ENERGY_SECONDS);
   delay(3000);                       // time to start the external logger
 
@@ -141,12 +159,26 @@ static void energy_run(int mode) {
   unsigned long n = 0;
   int64_t t_end = esp_timer_get_time() + (int64_t)ENERGY_SECONDS * 1000000;
 
-  digitalWrite(GPIO_MARKER,  mode == 1 ? HIGH : LOW);
-  digitalWrite(GPIO_MARKER2, mode == 2 ? HIGH : LOW);
+  digitalWrite(GPIO_MARKER,  (mode & 1) ? HIGH : LOW);
+  digitalWrite(GPIO_MARKER2, (mode & 2) ? HIGH : LOW);
   while (esp_timer_get_time() < t_end) {
     const float *x = &golden_in[(n % N_GOLDEN) * SNN_T * SNN_NF];
     if      (mode == 1) { snn_infer(x, y, &st);       sink += y[0]; n++; }
     else if (mode == 2) { snn_infer_dense(x, y, &st); sink += y[0]; n++; }
+#ifdef HAVE_MLP
+    else if (mode == 3) {
+      mlp_stats_t ms;
+      sink += mlp_infer(&mlp_golden_in[(n % N_MLP_GOLDEN) * MLP_T * MLP_NCH], &ms);
+      n++;
+    }
+#endif
+#ifdef HAVE_GRU
+    else if (mode == 3) {
+      gru_stats_t gs;
+      gru_infer(&gru_golden_in[(n % N_GRU_GOLDEN) * GRU_T * GRU_NF], gy, &gs);
+      sink += gy[0]; n++;
+    }
+#endif
   }
   digitalWrite(GPIO_MARKER,  LOW);
   digitalWrite(GPIO_MARKER2, LOW);
@@ -157,17 +189,100 @@ static void energy_run(int mode) {
   (void)sink;
 }
 
+#ifdef HAVE_MLP
+/* The ANN baseline receives the SAME raw window as the SNN and extracts its
+ * own features, so the two latencies are directly comparable. */
+static void ann_verify_and_latency() {
+  mlp_stats_t ms;
+  float worst = 0;
+  Serial.println(F("\n--- ANN baseline (MLP 4-8-8-1, 121 params) ---"));
+  for (int n = 0; n < N_MLP_GOLDEN; ++n) {
+    float y = mlp_infer(&mlp_golden_in[n * MLP_T * MLP_NCH], &ms);
+    float e = fabsf(y - mlp_golden_out[n]);
+    if (e > worst) worst = e;
+  }
+  Serial.printf("verify worst = %.3e  -> %s\n", worst,
+                worst < 1e-4f ? "PASS" : "FAIL");
+
+  volatile float sink = 0;
+  const int N = 2000;
+  for (int i = 0; i < 200; ++i)
+    sink += mlp_infer(&mlp_golden_in[(i % N_MLP_GOLDEN) * MLP_T * MLP_NCH], &ms);
+  int64_t t0 = esp_timer_get_time();
+  for (int i = 0; i < N; ++i)
+    sink += mlp_infer(&mlp_golden_in[(i % N_MLP_GOLDEN) * MLP_T * MLP_NCH], &ms);
+  int64_t t1 = esp_timer_get_time();
+  Serial.printf("ANN latency  : %8.2f us/inf   %lu MACs  %lu tanh calls\n",
+                (double)(t1 - t0) / N, ms.macs, ms.tanhs);
+  Serial.printf("weights      : %u B\n",
+                (unsigned)(sizeof(mlp_w0) + sizeof(mlp_b0) + sizeof(mlp_w1)
+                         + sizeof(mlp_b1) + sizeof(mlp_w2) + sizeof(mlp_b2)
+                         + sizeof(mlp_mu) + sizeof(mlp_sd)));
+  Serial.println(F("The ANN does far fewer MACs but pays for tanh and two"));
+  Serial.println(F("divisions; latency decides, not MAC count."));
+  (void)sink;
+}
+#endif
+
+#ifdef HAVE_GRU
+/* The GRU is the ANN counterpart for forecasting: it also unrolls 12
+ * timesteps, so unlike the soiling MLP it pays the same temporal cost the SNN
+ * does. This is the comparison that decides whether spiking is ever worth it. */
+static void gru_verify_and_latency() {
+  gru_stats_t gs;
+  float worst = 0;
+  Serial.println(F("\n--- ANN baseline (GRU 7-32 + Linear, 4035 params) ---"));
+  for (int n = 0; n < N_GRU_GOLDEN; ++n) {
+    gru_infer(&gru_golden_in[n * GRU_T * GRU_NF], gy, &gs);
+    for (int k = 0; k < GRU_NOUT; ++k) {
+      float e = fabsf(gy[k] - gru_golden_out[n * GRU_NOUT + k]);
+      if (e > worst) worst = e;
+    }
+  }
+  Serial.printf("verify worst = %.3e  -> %s\n", worst,
+                worst < 1e-4f ? "PASS" : "FAIL");
+
+  volatile float sink = 0;
+  const int N = 500;
+  for (int i = 0; i < 50; ++i) {
+    gru_infer(&gru_golden_in[(i % N_GRU_GOLDEN) * GRU_T * GRU_NF], gy, &gs);
+    sink += gy[0];
+  }
+  int64_t t0 = esp_timer_get_time();
+  for (int i = 0; i < N; ++i) {
+    gru_infer(&gru_golden_in[(i % N_GRU_GOLDEN) * GRU_T * GRU_NF], gy, &gs);
+    sink += gy[0];
+  }
+  int64_t t1 = esp_timer_get_time();
+  Serial.printf("GRU latency  : %8.2f us/inf   %lu MACs  %lu sigmoid/tanh\n",
+                (double)(t1 - t0) / N, gs.macs, gs.nonlin);
+  Serial.printf("weights      : %u B\n",
+                (unsigned)(sizeof(gru_w_ih) + sizeof(gru_b_ih) + sizeof(gru_w_hh)
+                         + sizeof(gru_b_hh) + sizeof(gru_out_w) + sizeof(gru_out_b)
+                         + sizeof(gru_mu) + sizeof(gru_sd)));
+  (void)sink;
+}
+#endif
+
 /* Headless sequence for the energy rig: no USB needed on this board.
  * The marker pin tells the Arduino which bucket each INA219 sample belongs to,
  * so the two modes are measured under identical conditions minutes apart. */
 static void auto_sequence() {
-  Serial.println(F("\nauto: repeating idle / event-driven / idle / dense until reset"));
+  Serial.println(F("\nauto: repeating idle / SNN-event / idle / SNN-dense / idle / ANN"));
   for (int cycle = 1; ; ++cycle) {
     Serial.printf("--- cycle %d ---\n", cycle);
     energy_run(0);
     energy_run(1);
     energy_run(0);
     energy_run(2);
+#ifdef HAVE_MLP
+    energy_run(0);
+    energy_run(3);
+#endif
+#ifdef HAVE_GRU
+    energy_run(0);
+    energy_run(3);
+#endif
   }
 }
 
@@ -199,6 +314,13 @@ void setup() {
    * is unreachable and the 'l' command can no longer be typed -- every number
    * the board can report has to be produced before the sequence starts. */
   latency();
+
+#ifdef HAVE_MLP
+  ann_verify_and_latency();
+#endif
+#ifdef HAVE_GRU
+  gru_verify_and_latency();
+#endif
 
   Serial.println(F("\nstarting energy sequence in 5 s (reset the board to stop)"));
   delay(5000);
