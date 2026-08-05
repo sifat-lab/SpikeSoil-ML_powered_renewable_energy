@@ -6,6 +6,7 @@
 #include "sensors.h"
 #include "logger.h"
 #include "inference.h"
+#include "replay.h"
 #include "webui.h"
 
 // Set to 0 to build the identical firmware without the SoftAP or HTTP server.
@@ -49,6 +50,25 @@ InferResult g_lastResult{};
 
 LoopTiming g_timing{};
 uint32_t g_lastStepMs = 0;
+
+// Set while replay owns the model, cleared on the first live tick after it
+// gives the model back. The sub-sample schedule is wall-clock and goes stale
+// during a replay of any length; resuming without re-anchoring it would burn
+// the whole backlog as late ticks and libel the live cadence counters.
+bool g_liveResyncPending = false;
+
+// Set alongside the resync so the first timestep after playback is not measured
+// against the last one before it. That gap is the replay, not a slow loop, and
+// counting it made maxStepMs read as minutes. Only the min/max period is
+// skipped: the tick counters below are honest across the switch (replay does
+// not drive them at all) and keep accumulating.
+bool g_stepBaselineStale = false;
+
+// Replay can run at 60x, which is twelve timesteps a second. Printing every
+// one of them turns the serial log -- the demo's diagnostic channel -- into a
+// waterfall, so it is thinned to roughly 1 Hz. The dashboard shows every row.
+constexpr uint32_t kReplayLogIntervalMs = 1000;
+uint32_t g_lastReplayLogMs = 0;
 
 // Per-channel accumulator: a channel that reads NAN on some sub-samples still
 // averages the ones that succeeded, and only yields NAN if all of them failed.
@@ -251,7 +271,7 @@ void noteTick(uint32_t nowMs, uint32_t scheduledMs) {
 }
 
 void noteStep(uint32_t nowMs) {
-  if (g_timing.steps > 0) {
+  if (g_timing.steps > 0 && !g_stepBaselineStale) {
     const uint32_t periodMs = nowMs - g_lastStepMs;
     if (periodMs < g_timing.minStepMs || g_timing.minStepMs == 0) {
       g_timing.minStepMs = periodMs;
@@ -259,7 +279,27 @@ void noteStep(uint32_t nowMs) {
     if (periodMs > g_timing.maxStepMs) g_timing.maxStepMs = periodMs;
   }
   g_lastStepMs = nowMs;
+  g_stepBaselineStale = false;  // this step is the new baseline
   g_timing.steps += 1;
+}
+
+// Serial counterpart of the dashboard's refill line.
+//
+// A source switch purges the shared 12-slot window (see replay.h), so the NaN
+// gate answers "sensor fault" for the twelve steps that follow -- true of the
+// buffer, and read at a demo as dead hardware. The page already names the real
+// cause; the log should not contradict it twelve times in a row.
+//
+// Boot's own refill is left to the kernel: g_windowFill is below the target
+// then too, but the state is WarmingUp, which is already the right word.
+void formatStepLine(const InferResult &res, char *out, size_t outLen) {
+  if (res.state != InferState::Valid && res.state != InferState::WarmingUp &&
+      replayWindowFill() < replayWindowNeeded()) {
+    snprintf(out, outLen, "[infer] refilling the %u-step window after a source switch (%u/%u)",
+             replayWindowNeeded(), replayWindowFill(), replayWindowNeeded());
+    return;
+  }
+  inferenceFormat(res, out, outLen);
 }
 
 // The 1 Hz timestep, lifted out of loop() unchanged so that loop() has a single
@@ -270,6 +310,7 @@ void runTimestep() {
   accumReset();
 
   inferencePush(step);
+  replayNoteWindowPush();  // the window is shared with replay; see replay.h
   g_lastResult = inferenceRun();
   noteStep(millis());
 
@@ -290,8 +331,32 @@ void runTimestep() {
   }
 
   char line[176];
-  inferenceFormat(g_lastResult, line, sizeof(line));
+  formatStepLine(g_lastResult, line, sizeof(line));
   Serial.println(line);
+}
+
+// Handed every completed replay timestep by replay.cpp.
+//
+// This is runTimestep()'s tail minus the two things replay must not do: no CSV
+// row is written, and the sample goes to the replay history ring rather than
+// the live one. Note what is *not* different -- the push and the kernel call
+// already happened inside replay.cpp through the same inferencePush() /
+// inferenceRun() pair used above.
+void onReplayStep(const SensorReading &r, const InferResult &res) {
+#if WEBUI_ENABLED
+  webuiPublishReplay(r, res);
+#else
+  (void)r;
+#endif
+
+  const uint32_t nowMs = millis();
+  if (nowMs - g_lastReplayLogMs >= kReplayLogIntervalMs) {
+    g_lastReplayLogMs = nowMs;
+    char line[176];
+    formatStepLine(res, line, sizeof(line));
+    Serial.print("[replay] ");
+    Serial.println(line);
+  }
 }
 
 }  // namespace
@@ -308,6 +373,10 @@ void setup() {
   if (!inferenceInit()) {
     Serial.println("[main] continuing as logger only; no loss estimate will be shown");
   }
+
+  // After loggerInit(): the scan borrows the card handle that call brought up.
+  replaySetEmitHandler(onReplayStep);
+  replayInit();
 
   // Order matters: the STA interface must be completely gone before the AP
   // comes up, so the two are never simultaneously live on the shared radio.
@@ -330,6 +399,38 @@ void setup() {
 
 void loop() {
   const uint32_t nowMs = millis();
+
+  // Replay owns the model. Everything below this branch is the live path, so
+  // taking it suspends sensor sampling, the SD log and the live history ring
+  // in one place -- there is no "skip the write" flag threaded through the
+  // logger, and no way for a replayed sample to reach live storage.
+  //
+  // Serviced on every loop() iteration rather than on the 250 ms tick: at 60x
+  // a row falls due every 83 ms, and the tick is too coarse to deliver that.
+  if (replayIsActive()) {
+    replayService(nowMs);
+    g_liveResyncPending = true;
+#if WEBUI_ENABLED
+    // Free-running here instead of once per tick. There is no 1 Hz cadence to
+    // protect while replay holds the model, and the dashboard is the only
+    // thing the operator can drive replay from, so it gets the whole loop.
+    webuiHandleClient();
+#endif
+    return;
+  }
+
+  if (g_liveResyncPending) {
+    // First live iteration after replay handed the model back. Re-anchor the
+    // schedule and drop the part-built accumulator; the sub-samples in it were
+    // taken before the replay and averaging them into this second would mix
+    // two moments into one timestep.
+    g_liveResyncPending = false;
+    g_stepBaselineStale = true;
+    g_subCount = 0;
+    accumReset();
+    g_nextSubMs = nowMs + kSubSampleMs;
+    return;
+  }
 
   if (static_cast<int32_t>(nowMs - g_nextSubMs) < 0) {
     return;

@@ -55,6 +55,15 @@ void webuiHandleClient();
 // the page.
 void webuiPublish(const SensorReading &r, const InferResult &res, const LoopTiming &t);
 
+// The replay counterpart, called once per replayed row.
+//
+// Deliberately a separate entry point rather than a flag on webuiPublish():
+// replayed samples land in their own snapshot and their own history ring, so
+// there is no path by which a recording can contaminate the live trace. The
+// live counters keep whatever values they held when replay started, and the
+// page shows both.
+void webuiPublishReplay(const SensorReading &r, const InferResult &res);
+
 // Marks timestamps as wall-clock-backed. Purely cosmetic: the page says whether
 // the session clock is real or relative to boot.
 void webuiSetTimeSynced(bool synced);

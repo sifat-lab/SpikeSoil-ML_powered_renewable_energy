@@ -62,6 +62,9 @@ canvas{width:100%;display:block;touch-action:pan-y}
 .cell .k{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
 .cell .v{font-size:17px;font-variant-numeric:tabular-nums;margin-top:2px}
 .cell .u{font-size:11px;color:var(--dim)}
+/* Held-over value from an earlier moment, not a reading from this second. Same
+   amber the large loss figure uses when it goes stale, for the same reason. */
+.cell .v.stale{color:var(--warn)}
 
 /* d. payback */
 .io{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
@@ -79,9 +82,78 @@ input[type=number]:focus{outline:none;border-color:var(--acc)}
 .note{font-size:11px;color:var(--dim);margin-top:10px;line-height:1.5}
 .warnbar{background:#3a2a08;border:1px solid #6b4c0c;color:#f0c674;font-size:12px;
   padding:8px 10px;border-radius:8px;margin-bottom:12px;display:none}
+
+/* e. replay.
+   The brief for this bar was "impossible to mistake replay for live", so it is
+   deliberately the loudest thing on the page: full-bleed, hazard-striped, stuck
+   to the top of the viewport through every scroll, and carrying the filename
+   and the row's own recorded timestamp rather than a generic warning. The whole
+   document changes colour with it -- amber outline, amber accent, amber loss
+   figure -- because a single banner can be scrolled past on a phone but a page
+   that has changed colour cannot be misread at a glance from two metres away,
+   which is the distance an examiner will be standing at. */
+#replaybar{display:none;position:sticky;top:0;z-index:50;margin:-12px -12px 12px;
+  padding:13px 12px 10px;background:#3a1d00;border-bottom:2px solid #ff9500;
+  box-shadow:0 8px 20px rgba(0,0,0,.6)}
+body.replay #replaybar{display:block}
+#replaybar::before{content:"";position:absolute;top:0;left:0;right:0;height:6px;
+  background:repeating-linear-gradient(135deg,#ff9500 0 11px,#241300 11px 22px)}
+.rb-top{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.rb-tag{font-size:15px;font-weight:800;letter-spacing:1.7px;color:#ffb340}
+.rb-play{color:#ffb340;font-size:13px;animation:rbp 1.5s ease-in-out infinite}
+@keyframes rbp{0%,100%{opacity:1}50%{opacity:.2}}
+.rb-st{font-size:11px;font-weight:700;letter-spacing:.8px;border:1px solid #ff9500;
+  color:#ffb340;border-radius:999px;padding:1px 9px;white-space:nowrap}
+.rb-meta{font-size:12px;color:#f0c674;margin-top:6px;line-height:1.55;
+  font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.rb-meta b{color:#fff;font-weight:600}
+.rb-bar{height:4px;background:#5a3400;border-radius:2px;margin-top:8px;overflow:hidden}
+.rb-bar i{display:block;height:100%;width:0;background:#ff9500;transition:width .3s linear}
+body.replay{outline:3px solid #ff9500;outline-offset:-3px}
+body.replay{--acc:#ff9500}
+body.replay .big{color:#ffb340}
+.chip{display:none;font-size:10px;font-weight:800;letter-spacing:1.2px;color:#1a1000;
+  background:#ff9500;border-radius:4px;padding:3px 7px;align-self:center}
+body.replay .chip{display:inline-block}
+
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+.seg button{background:#0b1119;color:var(--dim);border:0;padding:9px 20px;font:inherit;
+  font-weight:700;letter-spacing:1px;cursor:pointer}
+.seg button.on{background:var(--acc);color:#04121f}
+body.replay .seg button.on{color:#1a1000}
+.ctl{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.ctl button{background:#0b1119;border:1px solid var(--line);color:var(--tx);border-radius:8px;
+  padding:8px 14px;font:inherit;cursor:pointer}
+.ctl button:disabled{opacity:.35;cursor:default}
+select{width:100%;background:#0b1119;border:1px solid var(--line);color:var(--tx);
+  border-radius:8px;padding:8px 10px;font:inherit}
+select:focus,input[type=number]:focus{outline:none;border-color:var(--acc)}
+.err{color:var(--bad);font-size:12px;margin-top:8px}
+/* The replay clock sits in the same card as the live cadence block and has the
+   same shape -- a period, a late count, a resync count -- so at arm's length the
+   two read as one block rendered twice. Indenting it behind a rule makes it one
+   glance to see that the second grid belongs to playback, not to the loop. */
+#rtblock{margin-top:16px;border-left:3px solid #ff9500;padding-left:11px}
 </style>
 </head>
 <body>
+
+<div id="replaybar">
+  <div class="rb-top">
+    <span class="rb-play" id="rb_play">&#9654;</span>
+    <span class="rb-tag">RECORDED PLAYBACK</span>
+    <span class="rb-st" id="rb_state">PAUSED</span>
+  </div>
+  <div class="rb-meta">
+    Source <b id="rb_file">--</b><br>
+    Row <b id="rb_row">0</b> &middot; recorded <b id="rb_stamp">--</b>
+    &middot; <b id="rb_rec">--</b> into the session &middot; <b id="rb_pct">0</b>% of file
+  </div>
+  <div class="rb-bar"><i id="rb_fill"></i></div>
+  <div class="rb-meta" style="opacity:.8">The panel is not being measured. Every number below
+    comes from this file on the SD card, through the same model as live mode. Live sampling and
+    SD logging are paused.</div>
+</div>
 
 <header>
   <h1><b>Spike</b>Soil</h1>
@@ -93,18 +165,39 @@ input[type=number]:focus{outline:none;border-color:var(--acc)}
 <div class="card">
   <div class="loss">
     <div class="big none" id="big">--</div>
+    <span class="chip">RECORDED</span>
     <div class="sub" id="losssub"></div>
   </div>
   <div class="state s-warn" id="state"><span class="dot"></span><span id="statetx">waiting for node</span></div>
 </div>
 
 <div class="card">
-  <h2>Last 5 minutes</h2>
+  <h2>Data source</h2>
+  <div class="seg">
+    <button id="mLive" class="on">LIVE</button><button id="mReplay">REPLAY</button>
+  </div>
+  <div class="io" style="margin-top:12px">
+    <div><label for="rFile">Recording on SD card</label><select id="rFile"></select></div>
+    <div><label for="rSpeed">Speed (1-60x)</label><input type="number" id="rSpeed" min="1" max="60" step="1"></div>
+  </div>
+  <div class="ctl">
+    <button id="rPlay">Play</button>
+    <button id="rPause">Pause</button>
+    <button id="rRestart">Restart</button>
+    <button id="rScan">Rescan card</button>
+    <span class="sub" id="rState"></span>
+  </div>
+  <div class="err" id="rErr"></div>
+  <div class="note" id="rNote"></div>
+</div>
+
+<div class="card">
+  <h2 id="charttitle">Last 5 minutes</h2>
 
   <div class="sect">SOILING LOSS</div>
   <canvas id="chartLoss"></canvas>
   <div class="legend">
-    <label><input type="checkbox" id="cLoss" checked><span class="swatch" style="background:#58a6ff"></span>soiling loss</label>
+    <label><input type="checkbox" id="cLoss" checked><span class="swatch" id="swLoss" style="background:#58a6ff"></span>soiling loss</label>
   </div>
   <div class="note" id="lossnote"></div>
 
@@ -118,7 +211,7 @@ input[type=number]:focus{outline:none;border-color:var(--acc)}
 </div>
 
 <div class="card">
-  <h2>Live sensors</h2>
+  <h2 id="senstitle">Live sensors</h2>
   <div class="grid">
     <div class="cell"><div class="k">Lux</div><div class="v" id="v_lux">--</div></div>
     <div class="cell"><div class="k">B current</div><div class="v" id="v_ib">--<span class="u"> mA</span></div></div>
@@ -158,28 +251,52 @@ input[type=number]:focus{outline:none;border-color:var(--acc)}
     <div class="cell"><div class="k">Spike rate</div><div class="v" id="v_rate">--</div></div>
     <div class="cell"><div class="k">MACs</div><div class="v" id="v_macs">--</div></div>
     <div class="cell"><div class="k">Latency</div><div class="v" id="v_lat">--<span class="u"> ms</span></div></div>
-    <div class="cell"><div class="k">Step period</div><div class="v" id="v_step">--</div></div>
-    <div class="cell"><div class="k">Late ticks</div><div class="v" id="v_late">--</div></div>
     <div class="cell"><div class="k">Free heap</div><div class="v" id="v_heap">--<span class="u"> kB</span></div></div>
   </div>
+  <div class="note" id="nodenote"></div>
+
+  <div class="sect">LIVE LOOP CADENCE &middot; 1 Hz SENSOR PATH</div>
+  <div class="grid">
+    <div class="cell"><div class="k">Step period</div><div class="v" id="v_step">--</div></div>
+    <div class="cell"><div class="k">Late ticks</div><div class="v" id="v_late">--</div></div>
+    <div class="cell"><div class="k">Tick resyncs</div><div class="v" id="v_resync">--</div></div>
+  </div>
   <div class="note" id="timingnote"></div>
+
+  <div id="rtblock" style="display:none">
+    <div class="sect">REPLAY CLOCK &middot; RECORDED ROWS, NOT THE LIVE LOOP</div>
+    <div class="grid">
+      <div class="cell"><div class="k">Row period</div><div class="v" id="v_rper">--</div></div>
+      <div class="cell"><div class="k">Late rows</div><div class="v" id="v_rlate">--</div></div>
+      <div class="cell"><div class="k">Row resyncs</div><div class="v" id="v_rresync">--</div></div>
+      <div class="cell"><div class="k">Skipped rows</div><div class="v" id="v_rskip">--</div></div>
+    </div>
+    <div class="note" id="rtimingnote"></div>
+  </div>
 </div>
 
 <script>
 const $=i=>document.getElementById(i);
 const F=['arrayWp','sunHours','tariff','cleanCost'];
 let live=null, hist={now:0,rows:[]}, cfg=null, editing=null, missed=0;
+let rp={mode:'live',play:'stopped',speed:20,file:'',rowStamp:'',rowIndex:0,recordedS:0,
+        bytePos:0,byteTotal:0,error:'',rowPeriodMs:250,
+        timing:{rows:0,skipped:0,lateRows:0,maxLateMs:0,meanLateMs:0,resyncs:0,catchUpRows:0,minRowMs:0,maxRowMs:0}};
+let selBusy=false;
 
 const num=(v,d)=>v==null?'--':v.toFixed(d);
 const clamp01=v=>v<0?0:(v>1?1:v);
 
-/* ---- polling ---------------------------------------------------------- */
+/* ---- polling -----------------------------------------------------------
+   Both loops reschedule themselves rather than sitting on a fixed interval,
+   because replay runs on a different clock. At 20x a row lands every 250 ms,
+   so a 10 s history poll would draw a chart four hundred rows out of date.
+   In LIVE the old 1 s / 10 s cadence is unchanged. */
 async function pollState(){
   try{
     const r=await fetch('/api/state',{cache:'no-store'});
     live=await r.json(); missed=0;
-    $('conn').textContent='live';
-    $('conn').style.color='var(--ok)';
+    if(live.replay) rp=live.replay;
     if(cfg===null){cfg=live.config;fillInputs();}
     render();
   }catch(e){
@@ -192,14 +309,23 @@ async function pollHistory(){
     hist=await r.json(); draw();
   }catch(e){}
 }
+const replaying=()=>rp.mode=='replay';
+async function stateLoop(){ await pollState(); setTimeout(stateLoop, replaying()?500:1000); }
+async function historyLoop(){ await pollHistory(); setTimeout(historyLoop, replaying()?2000:10000); }
 
 /* ---- a + b: the number and why to trust it ---------------------------- */
 function render(){
   if(!live) return;
-  const s=$('state'), big=$('big');
+  const s=$('state'), big=$('big'), on=replaying();
 
+  renderReplay();
+
+  $('conn').textContent=on?'REPLAY':'live';
+  $('conn').style.color=on?'#ff9500':'var(--ok)';
   $('clock').textContent=(live.timeSynced?'clock synced':'uptime')+' '+fmtDur(live.uptimeS)
     +' · '+live.clients+' client'+(live.clients==1?'':'s');
+  $('charttitle').textContent=on?'Recorded session':'Last 5 minutes';
+  $('senstitle').textContent=on?'Sensors, as recorded':'Live sensors';
 
   let shown=null, stale=false;
   if(live.valid && live.lossDisplay!=null){ shown=live.lossDisplay; }
@@ -221,9 +347,24 @@ function render(){
   }
 
   // Never blank the screen while gated: show the last valid number and its age.
+  // The refill case is called out separately from the gate, because after a
+  // source switch the window is deliberately purged and the gate's own answer
+  // would be "sensor fault" -- true of the buffer, badly misleading about the
+  // hardware.
+  const filling=live.windowFill!=null && live.windowFill<live.windowNeeded;
   let cls='s-ok', tx='live estimate, updating every second';
-  if(!live.ready){ cls='s-warn'; tx='node starting up'; }
-  else if(live.valid){ cls='s-ok'; tx='live · '+live.state; }
+  if(!live.ready){ cls='s-warn'; tx=on?'no rows replayed yet — press Play':'node starting up'; }
+  else if(live.valid){ cls='s-ok'; tx=(on?'recorded':'live')+' · '+live.state; }
+  else if(filling){
+    /* Same counter, two different causes. At boot the window has genuinely
+       never been filled and the kernel reports "warming up"; after a source
+       switch it was filled and then purged, which the gate can only describe
+       as a NaN fault. Only the second one needs explaining away. */
+    cls='s-warn';
+    tx=(live.state=='warming up'?'warming up'
+        :'refilling the 12-step window after a source switch')
+      +' ('+live.windowFill+'/'+live.windowNeeded+')';
+  }
   else{
     cls=(live.state.indexOf('fault')>=0||live.state.indexOf('self-test')>=0)?'s-bad':'s-warn';
     tx='gated: '+live.state;
@@ -245,22 +386,134 @@ function render(){
   $('v_vb').innerHTML=num(live.vB,2)+'<span class="u"> V</span>';
   $('v_pb').innerHTML=num(live.pB_mW,0)+'<span class="u"> mW</span>';
   $('v_ia').innerHTML=num(live.iA_mA,1)+'<span class="u"> mA</span>';
-  $('v_rate').textContent=num(live.spikeRate,3);
-  $('v_macs').textContent=live.macs.toLocaleString();
-  $('v_lat').innerHTML=(live.latencyUs/1000).toFixed(2)+'<span class="u"> ms</span>';
+  /* Kernel cost. The forward pass only happens when the gate lets the window
+     through, so while it is closed spikeRate/macs/latencyUs are 0 -- true, and
+     read at two metres as a dead accelerator. Show the last pass that really
+     ran, in the warn colour with its age, and say so underneath. */
+  const ranNow=live.valid, haveRun=live.lastRunLatencyUs!=null;
+  const kRate=ranNow?live.spikeRate:live.lastRunRate;
+  const kMacs=ranNow?live.macs:live.lastRunMacs;
+  const kLat =ranNow?live.latencyUs:live.lastRunLatencyUs;
+  const kStale=!ranNow&&haveRun;
+  const kCls='v'+(kStale?' stale':'');
+  $('v_rate').className=kCls; $('v_macs').className=kCls; $('v_lat').className=kCls;
+  if(!ranNow&&!haveRun){
+    $('v_rate').textContent='--';
+    $('v_macs').textContent='--';
+    $('v_lat').innerHTML='--<span class="u"> ms</span>';
+    $('nodenote').textContent='Kernel idle — gate closed. No inference has run yet this session, '
+      +'so there is no spike rate, MAC count or latency to report.';
+  }else{
+    $('v_rate').textContent=num(kRate,3);
+    $('v_macs').textContent=kMacs.toLocaleString();
+    $('v_lat').innerHTML=(kLat/1000).toFixed(2)+'<span class="u"> ms</span>';
+    $('nodenote').textContent=kStale
+      ? 'Kernel idle — gate closed, so no pass ran this second. The three figures above are '
+        +'from the last inference '+fmtDur(live.secondsSinceRun)+' ago and are held, not recomputed.'
+      : 'Spike rate, MACs and latency are measured on this second’s forward pass.';
+  }
 
   const t=live.timing;
   $('v_step').innerHTML=t.steps>1?(t.minStepMs+'-'+t.maxStepMs+'<span class="u"> ms</span>'):'--';
   $('v_late').textContent=t.lateTicks+' / '+t.ticks;
+  $('v_resync').textContent=t.resyncs;
   $('v_heap').innerHTML=(live.heap/1024).toFixed(0)+'<span class="u"> kB</span>';
   $('timingnote').textContent='Sub-sample tick mean lateness '+t.meanLateMs.toFixed(2)
-    +' ms, worst '+t.maxLateMs+' ms, '+t.resyncs+' cadence resyncs. '
-    +'A late tick is one that fired more than 50 ms after its slot.';
+    +' ms, worst '+t.maxLateMs+' ms, over '+t.steps+' timesteps. '
+    +'A late tick is one that fired more than 50 ms after its slot. '
+    +'Step period skips the gap across a mode switch — the pause while playback ran '
+    +'is not a slow timestep — but the tick counters span the whole session. '
+    +'These are the live loop’s own counters and are shown in both modes: replay does not '
+    +'drive this loop, so they hold whatever they reached before playback started.';
 
   if($('lossLive').checked && editing!='lossIn'){
     $('lossIn').value=shown==null?'':shown.toFixed(3);
   }
   payback();
+}
+
+/* ---- e: replay banner, controls, clock counters ------------------------ */
+function renderReplay(){
+  const on=rp.mode=='replay';
+  document.body.classList.toggle('replay',on);
+  $('mLive').className=on?'':'on';
+  $('mReplay').className=on?'on':'';
+
+  if(editing!='rSpeed') $('rSpeed').value=rp.speed;
+  if(!selBusy && rp.file && $('rFile').value!=rp.file) $('rFile').value=rp.file;
+
+  $('rPlay').disabled=!on||rp.play=='playing'||rp.play=='finished';
+  $('rPause').disabled=!on||rp.play!='playing';
+  $('rRestart').disabled=!on;
+  $('rState').textContent=on?('replay '+rp.play):'live sensors drive the model';
+  $('rErr').textContent=rp.error||'';
+  $('rNote').textContent=on
+    ? 'One CSV row is one timestep, pushed through the same window buffer and the same snn_infer '
+      +'call the live path uses. A row covers 5 s of recorded time, so at '+rp.speed+'x it advances '
+      +'every '+rp.rowPeriodMs+' ms. Nothing is written to the SD card while this runs.'
+    : 'Replay reads a recording off the SD card and feeds it through the same model, for when the '
+      +'weather will not cooperate. Pick a file and press REPLAY. Live logging pauses while it runs.';
+
+  if(on){
+    const pct=rp.byteTotal?(100*rp.bytePos/rp.byteTotal):0;
+    $('rb_state').textContent=
+      rp.play=='playing'?('PLAYING '+rp.speed+'×')
+      :rp.play=='finished'?'END OF RECORDING'
+      :rp.play=='paused'?'PAUSED':'STOPPED';
+    $('rb_file').textContent=rp.file||'(no file selected)';
+    $('rb_stamp').textContent=rp.rowStamp||'--';
+    $('rb_row').textContent=rp.rowIndex.toLocaleString();
+    $('rb_rec').textContent=fmtDur(rp.recordedS);
+    $('rb_pct').textContent=pct.toFixed(0);
+    $('rb_fill').style.width=pct.toFixed(1)+'%';
+    $('rb_play').style.animationPlayState=rp.play=='playing'?'running':'paused';
+  }
+
+  /* Kept on screen after a replay ends, and in LIVE too: the point of these is
+     to be compared against the live cadence block above them, which is hard to
+     do if they vanish the moment you switch back. */
+  const rt=rp.timing, seen=rt.rows>0;
+  $('rtblock').style.display=seen?'block':'none';
+  if(!seen) return;
+  $('v_rper').innerHTML=rt.rows>1?(rt.minRowMs+'-'+rt.maxRowMs+'<span class="u"> ms</span>'):'--';
+  $('v_rlate').textContent=rt.lateRows+' / '+rt.rows;
+  $('v_rresync').textContent=rt.resyncs;
+  $('v_rskip').textContent=rt.skipped;
+  $('rtimingnote').textContent=(on?'':'From the last playback; replay is not running now. ')
+    +'Target '+rp.rowPeriodMs+' ms per row at '+rp.speed+'x. Mean lateness '
+    +rt.meanLateMs.toFixed(2)+' ms, worst '+rt.maxLateMs+' ms, over '+rt.rows+' rows. '
+    +rt.catchUpRows+' rows were emitted back-to-back to make up lost ground, and '
+    +rt.skipped+' malformed rows were stepped over rather than aborting the file.';
+}
+
+function replayPost(params){
+  const b=new URLSearchParams(params);
+  return fetch('/api/replay',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b})
+    .then(r=>r.json()).then(j=>{rp=j;if(live)live.replay=j;renderReplay();pollState();pollHistory();})
+    .catch(()=>{});
+}
+
+async function loadFiles(rescan){
+  try{
+    const r=await fetch('/api/files'+(rescan?'?rescan=1':''),{cache:'no-store'});
+    const d=await r.json(), sel=$('rFile');
+    sel.innerHTML='';
+    if(!d.count){
+      const o=document.createElement('option');
+      o.value=''; o.textContent='no CSV recordings found on the card';
+      sel.appendChild(o); sel.disabled=true;
+    }else{
+      sel.disabled=false;
+      for(const f of d.files){
+        const o=document.createElement('option');
+        o.value=f.name;
+        o.textContent=f.name+'  ('+(f.size/1024).toFixed(0)+' kB)';
+        sel.appendChild(o);
+      }
+      if(d.selected) sel.value=d.selected;
+    }
+  }catch(e){}
 }
 
 function fmtDur(s){
@@ -388,9 +641,14 @@ function drawLoss(){
     $('lossnote').textContent='Loss trace hidden.';
     return;
   }
-  const clip=trace(p,rows,w,1,'#58a6ff',0,1,2,1);
-  $('lossnote').textContent = 'Fixed 0 to 1 axis. Gaps are seconds the gate held the estimate back.'
-    + (clip?' Samples outside 0-1 are drawn at the axis limit.':'');
+  const rec=hist.source=='replay';
+  $('swLoss').style.background=rec?'#ff9500':'#58a6ff';
+  const clip=trace(p,rows,w,1,rec?'#ff9500':'#58a6ff',0,1,2,1);
+  $('lossnote').textContent = 'Fixed 0 to 1 axis. Gaps are '
+    + (rec?'rows':'seconds') + ' the gate held the estimate back.'
+    + (clip?' Samples outside 0-1 are drawn at the axis limit.':'')
+    + (rec?' The time axis is recorded time, one row every '+(hist.stepS||5)
+           +' s, not wall clock — this is a recording, not the panel.':'');
 }
 
 function drawCtx(){
@@ -482,9 +740,33 @@ $('lossLive').addEventListener('change',render);
 for(const k of ['cLoss','cLux','cIb']) $(k).addEventListener('change',draw);
 addEventListener('resize',draw);
 
-pollState(); pollHistory();
-setInterval(pollState,1000);
-setInterval(pollHistory,10000);
+/* ---- replay controls ---------------------------------------------------
+   Every button is one POST to /api/replay and one immediate re-poll, so the
+   banner and the loss figure can never disagree about which source is on
+   screen: they are read back out of the same document. */
+$('mLive').onclick=()=>replayPost({mode:'live'});
+$('mReplay').onclick=()=>replayPost({file:$('rFile').value||'',mode:'replay'});
+$('rPlay').onclick=()=>replayPost({cmd:'play'});
+$('rPause').onclick=()=>replayPost({cmd:'pause'});
+$('rRestart').onclick=()=>replayPost({cmd:'restart'});
+$('rScan').onclick=()=>loadFiles(true).then(()=>replayPost({}));
+$('rFile').addEventListener('focus',()=>selBusy=true);
+$('rFile').addEventListener('blur',()=>selBusy=false);
+$('rFile').addEventListener('change',()=>{selBusy=false;replayPost({file:$('rFile').value});});
+
+let speedTimer=null;
+$('rSpeed').addEventListener('focus',()=>editing='rSpeed');
+$('rSpeed').addEventListener('blur',()=>editing=null);
+$('rSpeed').addEventListener('input',()=>{
+  clearTimeout(speedTimer);
+  speedTimer=setTimeout(()=>{
+    const v=Math.round(+$('rSpeed').value);
+    if(v>=1&&v<=60) replayPost({speed:v});
+  },400);
+});
+
+loadFiles(false);
+stateLoop(); historyLoop();
 </script>
 </body>
 </html>)HTML";

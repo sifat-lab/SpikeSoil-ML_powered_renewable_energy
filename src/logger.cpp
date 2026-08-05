@@ -129,3 +129,8 @@ bool loggerWriteRow(const String &dateKey, const String &timestamp, uint32_t epo
   f.close();
   return true;
 }
+
+// Pure accessor: it adds a reader to the existing card handle and changes
+// nothing about how rows are written. See the note in logger.h for why replay
+// borrows this instead of mounting the card a second time.
+SdFat *loggerSdCard() { return ensureSdReady() ? &sd : nullptr; }

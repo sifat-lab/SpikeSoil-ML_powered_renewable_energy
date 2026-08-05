@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <math.h>
 
+#include "replay.h"
 #include "secrets.h"
 #include "webui_page.h"
 
@@ -14,6 +15,13 @@ constexpr uint16_t kHttpPort = 80;
 
 // 300 samples at 1 Hz = the last 300 seconds.
 constexpr uint16_t kHistSlots = 300;
+
+// The replay ring is longer because its samples are 5 s apart, not 1 s: 600
+// rows is 50 minutes of recorded time, which is enough to hold a whole soiling
+// session on screen at once. That matters for the 31 July recording -- the
+// climb from clean glass to 50 g/m2 is the thing being shown, and a window
+// that scrolled it off the left would lose the argument.
+constexpr uint16_t kReplayHistSlots = 600;
 
 // Flush the history response about every kilobyte instead of building the whole
 // ~10 kB body in RAM first.
@@ -35,6 +43,27 @@ String jnum(float v, unsigned int dp) {
   return String(v, dp);
 }
 
+// Filenames come off a FAT directory, so they are not trusted to be clean JSON
+// string content even though this logger only ever writes log_*.csv.
+String jstr(const char *s) {
+  String out;
+  out.reserve(strlen(s) + 8);
+  out += '"';
+  for (const char *p = s; *p != '\0'; ++p) {
+    const char c = *p;
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if (static_cast<unsigned char>(c) < 0x20) {
+      out += ' ';
+    } else {
+      out += c;
+    }
+  }
+  out += '"';
+  return out;
+}
+
 struct Snapshot {
   uint8_t state;
   float loss;
@@ -53,6 +82,16 @@ struct Snapshot {
   float lastValidLoss;
   float lastValidEma;
   uint32_t lastValidMs;
+
+  // Cost of the last inference that actually ran. Separate from the last-valid
+  // loss latch above: that one answers "what was the panel doing", this one
+  // answers "what does a forward pass cost", and the gate closing does not make
+  // the second question stale. Zeros in these three cells read as dead silicon.
+  bool hasRun;
+  float lastRunRate;
+  unsigned long lastRunMacs;
+  uint32_t lastRunLatencyUs;
+  uint32_t lastRunMs;
 
   LoopTiming timing;
 };
@@ -86,6 +125,16 @@ bool g_snapReady = false;
 
 HistEntry g_hist[kHistSlots];
 uint32_t g_histTotal = 0;
+
+// Replay's own snapshot, ring and latch. Nothing here is ever written by the
+// live path and nothing in the live pair above is ever written by replay, so
+// "did that number come from the panel or from the card" is answered by which
+// variable it lives in, not by a flag that could be read at the wrong moment.
+Snapshot g_rsnap{};
+bool g_rsnapReady = false;
+
+HistEntry g_rhist[kReplayHistSlots];
+uint32_t g_rhistTotal = 0;
 
 // arrayWp defaults to a whole rooftop installation, not the 100 Wp test panel
 // on the bench. At 100 Wp one cleaning pays back in roughly 400 days even at
@@ -122,17 +171,90 @@ String configJson() {
   return j;
 }
 
+const char *replayPlayName(ReplayPlay p) {
+  switch (p) {
+    case ReplayPlay::Playing:  return "playing";
+    case ReplayPlay::Paused:   return "paused";
+    case ReplayPlay::Finished: return "finished";
+    default:                   return "stopped";
+  }
+}
+
+// The block the banner is built from. Emitted inside /api/state on every poll
+// so the page can never render a frame in which the loss is from a recording
+// but the banner has not caught up yet -- source and value arrive together, in
+// one document, or not at all.
+String replayJson() {
+  const ReplayStatus &st = replayStatus();
+  const ReplayTiming &t = replayTiming();
+
+  String j;
+  j.reserve(576);
+  j += F("{\"mode\":\"");
+  j += (st.mode == ReplayMode::Replay) ? F("replay") : F("live");
+  j += F("\",\"play\":\"");
+  j += replayPlayName(st.play);
+  j += F("\",\"speed\":");
+  j += String(st.speed);
+  j += F(",\"rowPeriodMs\":");
+  j += String(st.rowPeriodMs);
+  j += F(",\"file\":");
+  j += jstr(st.file);
+  j += F(",\"rowStamp\":");
+  j += jstr(st.rowStamp);
+  j += F(",\"rowEpoch\":");
+  j += String(st.rowEpoch);
+  j += F(",\"rowIndex\":");
+  j += String(st.rowIndex);
+  j += F(",\"recordedS\":");
+  j += String(st.recordedS);
+  j += F(",\"bytePos\":");
+  j += String(st.bytePos);
+  j += F(",\"byteTotal\":");
+  j += String(st.byteTotal);
+  j += F(",\"error\":");
+  j += jstr(st.error);
+
+  j += F(",\"timing\":{\"rows\":");
+  j += String(t.rowsEmitted);
+  j += F(",\"skipped\":");
+  j += String(t.rowsSkipped);
+  j += F(",\"lateRows\":");
+  j += String(t.lateRows);
+  j += F(",\"maxLateMs\":");
+  j += String(t.maxLateMs);
+  j += F(",\"meanLateMs\":");
+  j += String(t.rowsEmitted ? (static_cast<float>(t.sumLateMs) / t.rowsEmitted) : 0.0f, 2);
+  j += F(",\"resyncs\":");
+  j += String(t.resyncs);
+  j += F(",\"catchUpRows\":");
+  j += String(t.catchUpRows);
+  j += F(",\"minRowMs\":");
+  j += String(t.rowsEmitted > 1 ? t.minRowMs : 0);
+  j += F(",\"maxRowMs\":");
+  j += String(t.rowsEmitted > 1 ? t.maxRowMs : 0);
+  j += F("}}");
+  return j;
+}
+
 void handleRoot() {
   g_server.send_P(200, "text/html; charset=utf-8", kIndexHtml);
 }
 
 void handleState() {
-  const Snapshot &s = g_snap;
-  const bool ready = g_snapReady;
+  // Which snapshot answers depends on who owns the model right now. The rest
+  // of the document is identical in both modes, which is the point: the page
+  // renders the same widgets either way and the banner says where the numbers
+  // came from.
+  const bool replaying = replayIsActive();
+  const Snapshot &s = replaying ? g_rsnap : g_snap;
+  const bool ready = replaying ? g_rsnapReady : g_snapReady;
   const uint32_t nowMs = millis();
 
+  // Sized for the whole document including the replay block, so the once-a-
+  // second poll does not walk a String through four reallocations on the way.
   String j;
-  j.reserve(768);
+  j.reserve(1792);  // +the last-run block
   j += F("{\"ready\":");
   j += ready ? F("true") : F("false");
 
@@ -183,6 +305,19 @@ void handleState() {
   j += F(",\"latencyUs\":");
   j += String(s.latencyUs);
 
+  // The same three figures from the last forward pass that actually happened,
+  // with their age. While the gate is closed the live trio above is 0/0/0 --
+  // truthfully, since no pass ran -- and the page shows these instead.
+  const bool haveRun = ready && s.hasRun;
+  j += F(",\"lastRunRate\":");
+  j += haveRun ? jnum(s.lastRunRate, 4) : String(F("null"));
+  j += F(",\"lastRunMacs\":");
+  j += haveRun ? String(s.lastRunMacs) : String(F("null"));
+  j += F(",\"lastRunLatencyUs\":");
+  j += haveRun ? String(s.lastRunLatencyUs) : String(F("null"));
+  j += F(",\"secondsSinceRun\":");
+  j += haveRun ? String((nowMs - s.lastRunMs) / 1000) : String(F("null"));
+
   j += F(",\"uptimeS\":");
   j += String(nowMs / 1000);
   j += F(",\"ageMs\":");
@@ -194,7 +329,19 @@ void handleState() {
   j += F(",\"clients\":");
   j += String(WiFi.softAPgetStationNum());
 
-  const LoopTiming &t = s.timing;
+  // Window fill after a mode switch. The 12-slot window is shared, so a switch
+  // purges it (see replay.h) and the gate would report "sensor fault" for the
+  // twelve steps that follow. That reads as broken hardware at a demo, so the
+  // page is given the real reason instead.
+  j += F(",\"windowFill\":");
+  j += String(replayWindowFill());
+  j += F(",\"windowNeeded\":");
+  j += String(replayWindowNeeded());
+
+  // Always the live loop's counters, in both modes. Replay does not perturb
+  // them and must not appear to: they keep whatever they held when replay
+  // started, and replay.timing below reports the replay clock separately.
+  const LoopTiming &t = g_snap.timing;
   j += F(",\"timing\":{\"ticks\":");
   j += String(t.ticks);
   j += F(",\"steps\":");
@@ -213,32 +360,50 @@ void handleState() {
   j += String(t.steps > 1 ? t.maxStepMs : 0);
   j += F("},\"config\":");
   j += configJson();
+  j += F(",\"replay\":");
+  j += replayJson();
   j += '}';
 
   g_server.sendHeader(F("Cache-Control"), F("no-store"));
   g_server.send(200, F("application/json"), j);
 }
 
+// One ring or the other, never a merge.
+//
+// The two use different time axes and that is deliberate. Live entries are
+// stamped with seconds since boot; replay entries with seconds *into the
+// recording*, so the chart's "-120s" reads as two minutes of recorded time
+// rather than two minutes of wall clock -- at 20x those differ by a factor of
+// twenty and only one of them is a fact about the panel.
 void handleHistory() {
-  const uint32_t total = g_histTotal;
-  const uint16_t n = (total >= kHistSlots) ? kHistSlots : static_cast<uint16_t>(total);
+  const bool replaying = replayIsActive();
+  const HistEntry *ring = replaying ? g_rhist : g_hist;
+  const uint16_t slots = replaying ? kReplayHistSlots : kHistSlots;
+  const uint32_t total = replaying ? g_rhistTotal : g_histTotal;
+  const uint32_t nowT = replaying ? replayStatus().recordedS : (millis() / 1000);
+
+  const uint16_t n = (total >= slots) ? slots : static_cast<uint16_t>(total);
   const uint32_t first = total - n;
 
-  // Chunked, so 300 rows never exist as one ~10 kB String.
+  // Chunked, so the rows never exist as one large String.
   g_server.sendHeader(F("Cache-Control"), F("no-store"));
   g_server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   g_server.send(200, F("application/json"), "");
 
   String buf;
   buf.reserve(kChunkBytes + 128);
-  buf += F("{\"now\":");
-  buf += String(millis() / 1000);
+  buf += F("{\"source\":\"");
+  buf += replaying ? F("replay") : F("live");
+  buf += F("\",\"stepS\":");
+  buf += replaying ? F("5") : F("1");
+  buf += F(",\"now\":");
+  buf += String(nowT);
   buf += F(",\"n\":");
   buf += String(n);
   buf += F(",\"cols\":[\"t\",\"loss\",\"lux\",\"iB\"],\"rows\":[");
 
   for (uint16_t i = 0; i < n; ++i) {
-    const HistEntry &e = g_hist[(first + i) % kHistSlots];
+    const HistEntry &e = ring[(first + i) % slots];
     if (i) buf += ',';
     buf += '[';
     buf += String(e.t);
@@ -272,6 +437,84 @@ void handleConfig() {
   g_server.send(200, F("application/json"), configJson());
 }
 
+// The file picker's contents. Served from the cached directory listing, so a
+// phone polling the dashboard never triggers an SD scan; ?rescan=1 is the only
+// thing that walks the card again.
+void handleFiles() {
+  if (g_server.hasArg("rescan")) replayRescan();
+
+  const uint8_t n = replayFileCount();
+  String j;
+  j.reserve(64 + n * 64);
+  j += F("{\"count\":");
+  j += String(n);
+  j += F(",\"selected\":");
+  j += jstr(replayStatus().file);
+  j += F(",\"files\":[");
+  for (uint8_t i = 0; i < n; ++i) {
+    if (i) j += ',';
+    j += F("{\"name\":");
+    j += jstr(replayFileName(i));
+    j += F(",\"size\":");
+    j += String(replayFileSize(i));
+    j += '}';
+  }
+  j += F("]}");
+
+  g_server.sendHeader(F("Cache-Control"), F("no-store"));
+  g_server.send(200, F("application/json"), j);
+}
+
+// The whole replay control surface, one endpoint, every field optional:
+//   ?mode=live|replay & file=<name> & speed=1..60 & cmd=play|pause|restart
+//
+// Applied in that order on purpose. Selecting a file while the node is still
+// LIVE only records the choice -- it must not reach into the shared window --
+// and the mode switch that follows in the same request is what opens it. Doing
+// it the other way round would open the previously selected file first and
+// replay a second of the wrong recording before switching.
+void handleReplayCtl() {
+  if (g_server.hasArg("rescan")) replayRescan();
+
+  if (g_server.hasArg("file")) {
+    const String f = g_server.arg("file");
+    if (f.length() > 0) replaySelectFile(f.c_str());
+  }
+  if (g_server.hasArg("speed")) {
+    const long v = g_server.arg("speed").toInt();
+    if (v > 0) replaySetSpeed(static_cast<uint8_t>(v > 255 ? 255 : v));
+  }
+  if (g_server.hasArg("mode")) {
+    const String m = g_server.arg("mode");
+    if (m == "replay") {
+      replaySetMode(ReplayMode::Replay);
+    } else if (m == "live") {
+      replaySetMode(ReplayMode::Live);
+    }
+  }
+  if (g_server.hasArg("cmd")) {
+    const String c = g_server.arg("cmd");
+    if (c == "play") {
+      replayPlay();
+    } else if (c == "pause") {
+      replayPause();
+    } else if (c == "restart") {
+      replayRestart();
+    }
+  }
+
+  // Anything that put the reader back at row zero -- entering replay, changing
+  // file, restarting -- also drops the replay view, so the page cannot show a
+  // number left over from the previous recording next to the new filename.
+  if (replayStatus().rowIndex == 0) {
+    g_rsnapReady = false;
+    g_rhistTotal = 0;
+  }
+
+  g_server.sendHeader(F("Cache-Control"), F("no-store"));
+  g_server.send(200, F("application/json"), replayJson());
+}
+
 // Browsers ask for this unprompted on every page load, and a phone that keeps
 // the tab open asks again. 204 answers it in one segment with no body and,
 // more to the point, keeps it out of the 404 path.
@@ -285,6 +528,67 @@ void handleFavicon() {
 // and short so an unknown path costs one small segment and one loop tick.
 void handleNotFound() {
   g_server.send(404, F("text/plain"), F("not found"));
+}
+
+// Snapshot fill plus the last-valid latch, shared by both publish paths so the
+// two modes cannot drift apart in how they present a gated reading.
+//
+// The latch lives here, not in inference.cpp: the gate deliberately drops the
+// last value (it clears the EMA prime on purpose), so carrying it forward is a
+// presentation decision and belongs on the presentation side. prev is the
+// caller's own previous snapshot, which is what keeps the live and replay
+// latches independent.
+Snapshot buildSnapshot(const SensorReading &r, const InferResult &res, const Snapshot &prev,
+                       uint32_t nowMs, bool *validOut) {
+  Snapshot s;
+  s.state = static_cast<uint8_t>(res.state);
+  s.loss = res.loss;
+  s.lossEma = res.lossEma;
+  s.spikeRate = res.spikeRate;
+  s.lux = res.lux;
+  s.iB_mA = res.iB_mA;
+  s.vB = r.vB_V;
+  s.pB_mW = r.pB_mW;
+  s.iA_mA = r.iA_mA;
+  s.macs = res.macs;
+  s.latencyUs = res.latencyUs;
+  s.stampMs = nowMs;
+  s.timing = prev.timing;
+
+  // Every gated path in inferenceRun() returns before snn_infer() and leaves
+  // latencyUs at its initialised 0, so a non-zero latency is the exact test for
+  // "the kernel ran this timestep" -- including the rare run that produced a
+  // non-finite loss, whose cycle count is still a real measurement.
+  const bool ran = (res.latencyUs != 0);
+  if (ran) {
+    s.hasRun = true;
+    s.lastRunRate = res.spikeRate;
+    s.lastRunMacs = res.macs;
+    s.lastRunLatencyUs = res.latencyUs;
+    s.lastRunMs = nowMs;
+  } else {
+    s.hasRun = prev.hasRun;
+    s.lastRunRate = prev.lastRunRate;
+    s.lastRunMacs = prev.lastRunMacs;
+    s.lastRunLatencyUs = prev.lastRunLatencyUs;
+    s.lastRunMs = prev.lastRunMs;
+  }
+
+  const bool valid = (res.state == InferState::Valid) && finiteVal(res.loss);
+  if (valid) {
+    s.hasValid = true;
+    s.lastValidLoss = res.loss;
+    s.lastValidEma = res.lossEma;
+    s.lastValidMs = nowMs;
+  } else {
+    s.hasValid = prev.hasValid;
+    s.lastValidLoss = prev.lastValidLoss;
+    s.lastValidEma = prev.lastValidEma;
+    s.lastValidMs = prev.lastValidMs;
+  }
+
+  *validOut = valid;
+  return s;
 }
 
 }  // namespace
@@ -307,6 +611,11 @@ bool webuiBegin() {
   g_server.on("/api/state", HTTP_GET, handleState);
   g_server.on("/api/history", HTTP_GET, handleHistory);
   g_server.on("/api/config", HTTP_POST, handleConfig);
+  g_server.on("/api/files", HTTP_GET, handleFiles);
+  // Both verbs: the page POSTs a form body, and a bare curl with a query
+  // string is the quickest way to drive replay from a laptop on the AP.
+  g_server.on("/api/replay", HTTP_POST, handleReplayCtl);
+  g_server.on("/api/replay", HTTP_GET, handleReplayCtl);
   g_server.on("/favicon.ico", HTTP_GET, handleFavicon);
   g_server.onNotFound(handleNotFound);
 
@@ -325,36 +634,9 @@ void webuiSetTimeSynced(bool synced) { g_timeSynced = synced; }
 void webuiPublish(const SensorReading &r, const InferResult &res, const LoopTiming &t) {
   const uint32_t nowMs = millis();
 
-  Snapshot s;
-  s.state = static_cast<uint8_t>(res.state);
-  s.loss = res.loss;
-  s.lossEma = res.lossEma;
-  s.spikeRate = res.spikeRate;
-  s.lux = res.lux;
-  s.iB_mA = res.iB_mA;
-  s.vB = r.vB_V;
-  s.pB_mW = r.pB_mW;
-  s.iA_mA = r.iA_mA;
-  s.macs = res.macs;
-  s.latencyUs = res.latencyUs;
-  s.stampMs = nowMs;
+  bool valid = false;
+  Snapshot s = buildSnapshot(r, res, g_snap, nowMs, &valid);
   s.timing = t;
-
-  // The latch lives here, not in inference.cpp: the gate deliberately drops the
-  // last value (it clears the EMA prime on purpose), so carrying it forward is
-  // a presentation decision and belongs on the presentation side.
-  const bool valid = (res.state == InferState::Valid) && finiteVal(res.loss);
-  if (valid) {
-    s.hasValid = true;
-    s.lastValidLoss = res.loss;
-    s.lastValidEma = res.lossEma;
-    s.lastValidMs = nowMs;
-  } else {
-    s.hasValid = g_snap.hasValid;
-    s.lastValidLoss = g_snap.lastValidLoss;
-    s.lastValidEma = g_snap.lastValidEma;
-    s.lastValidMs = g_snap.lastValidMs;
-  }
 
   g_snap = s;
   g_snapReady = true;
@@ -366,4 +648,31 @@ void webuiPublish(const SensorReading &r, const InferResult &res, const LoopTimi
   e.iB = res.iB_mA;
   g_hist[g_histTotal % kHistSlots] = e;
   g_histTotal += 1;
+}
+
+void webuiPublishReplay(const SensorReading &r, const InferResult &res) {
+  const ReplayStatus &st = replayStatus();
+
+  // Row one of a pass: a restart or a file change put the reader back to the
+  // top, so clear the view before the new pass writes into it. Cheap enough to
+  // do unconditionally, and it makes the reset correct whether it was reached
+  // through /api/replay or by the file simply being reopened.
+  if (st.rowIndex <= 1) {
+    g_rhistTotal = 0;
+    g_rsnap = Snapshot{};
+  }
+
+  const uint32_t nowMs = millis();
+  bool valid = false;
+  g_rsnap = buildSnapshot(r, res, g_rsnap, nowMs, &valid);
+  g_rsnapReady = true;
+
+  // Stamped in recorded seconds rather than wall clock -- see handleHistory().
+  HistEntry e;
+  e.t = st.recordedS;
+  e.loss = valid ? res.loss : NAN;
+  e.lux = res.lux;
+  e.iB = res.iB_mA;
+  g_rhist[g_rhistTotal % kReplayHistSlots] = e;
+  g_rhistTotal += 1;
 }
